@@ -76,35 +76,40 @@ fn machine_name(machine: Machine) -> SharedString {
 /// cross the SSH connection, come out at the exit, reach the target. A local
 /// and a remote forward differ in which machine is the entrance and which
 /// the exit; a dynamic forward differs in the target.
-pub(super) fn stops(kind: ForwardKind, bind: &SharedString, target: &SharedString) -> [Stop; 3] {
+pub(super) fn stops(
+    kind: ForwardKind,
+    has_target: bool,
+    bind: &SharedString,
+    target: &SharedString,
+) -> [Stop; 3] {
     let (entrance, exit) = match kind {
         ForwardKind::Local | ForwardKind::Dynamic => (Machine::Local, Machine::Server),
         ForwardKind::Remote => (Machine::Server, Machine::Local),
     };
-    let reached = match kind {
-        ForwardKind::Dynamic => Stop {
+    let reached = if !has_target {
+        Stop {
             role: t!("forward.diagram.target"),
             machine: Machine::Anywhere,
             name: machine_name(Machine::Anywhere),
             detail: t!("forward.diagram.app_chooses"),
-        },
-        ForwardKind::Local | ForwardKind::Remote => Stop {
+        }
+    } else {
+        Stop {
             role: t!("forward.diagram.target"),
             machine: Machine::Target,
             name: machine_name(Machine::Target),
             detail: target.clone(),
-        },
+        }
     };
     [
         Stop {
             role: t!("forward.diagram.entrance"),
             machine: entrance,
             name: machine_name(entrance),
-            detail: match kind {
-                ForwardKind::Dynamic => format!("SOCKS {bind}").into(),
-                ForwardKind::Local | ForwardKind::Remote => {
-                    t!("forward.diagram.listens", bind = bind)
-                }
+            detail: if !has_target {
+                format!("SOCKS {bind}").into()
+            } else {
+                t!("forward.diagram.listens", bind = bind)
             },
         },
         Stop {
@@ -118,10 +123,18 @@ pub(super) fn stops(kind: ForwardKind, bind: &SharedString, target: &SharedStrin
 }
 
 /// What the rule does, as one sentence with the form's own addresses.
-pub(super) fn explain(kind: ForwardKind, bind: &str, target: &str) -> SharedString {
+pub(super) fn explain(
+    kind: ForwardKind,
+    has_target: bool,
+    bind: &str,
+    target: &str,
+) -> SharedString {
     match kind {
         ForwardKind::Local => t!("forward.explain.local", bind = bind, target = target),
-        ForwardKind::Remote => t!("forward.explain.remote", bind = bind, target = target),
+        ForwardKind::Remote if has_target => {
+            t!("forward.explain.remote", bind = bind, target = target)
+        }
+        ForwardKind::Remote => t!("forward.explain.remote_dynamic", bind = bind),
         ForwardKind::Dynamic => t!("forward.explain.dynamic", bind = bind),
     }
 }
@@ -145,10 +158,11 @@ pub(super) fn ssh_flag(kind: ForwardKind) -> &'static str {
 }
 
 /// A situation each kind is typically the answer to.
-pub(super) fn typical_use(kind: ForwardKind) -> SharedString {
+pub(super) fn typical_use(kind: ForwardKind, has_target: bool) -> SharedString {
     match kind {
         ForwardKind::Local => t!("forward.typical_use.local"),
-        ForwardKind::Remote => t!("forward.typical_use.remote"),
+        ForwardKind::Remote if has_target => t!("forward.typical_use.remote"),
+        ForwardKind::Remote => t!("forward.typical_use.remote_dynamic"),
         ForwardKind::Dynamic => t!("forward.typical_use.dynamic"),
     }
 }
@@ -190,6 +204,7 @@ fn flow_dots(progress: f32) -> (Option<Dot>, Option<Dot>) {
 #[derive(IntoElement)]
 pub(super) struct ForwardDiagram {
     kind: ForwardKind,
+    has_target: bool,
     bind: SharedString,
     target: SharedString,
     flow: u64,
@@ -200,12 +215,14 @@ impl ForwardDiagram {
     /// the playback it has, a new number starts it over at the entrance.
     pub(super) fn new(
         kind: ForwardKind,
+        has_target: bool,
         bind: impl Into<SharedString>,
         target: impl Into<SharedString>,
         flow: u64,
     ) -> Self {
         Self {
             kind,
+            has_target,
             bind: bind.into(),
             target: target.into(),
             flow,
@@ -230,7 +247,7 @@ impl RenderOnce for ForwardDiagram {
         // which is the rest: no dot, and the arrows carry the direction.
         let (tunnel_dot, plain_dot) = flow_dots(flow.value);
 
-        let [entrance, exit, reached] = stops(self.kind, &self.bind, &self.target);
+        let [entrance, exit, reached] = stops(self.kind, self.has_target, &self.bind, &self.target);
         let summary = format!("{} → {} → {}", entrance.name, exit.name, reached.name);
         h_flex()
             .id("forward-diagram")
@@ -390,6 +407,7 @@ mod tests {
     fn a_local_forward_enters_here_and_leaves_at_the_server() {
         let [entrance, exit, reached] = stops(
             ForwardKind::Local,
+            true,
             &text("127.0.0.1:8080"),
             &text("db.internal:3306"),
         );
@@ -407,6 +425,7 @@ mod tests {
     fn a_remote_forward_is_the_same_picture_with_the_machines_swapped() {
         let [entrance, exit, reached] = stops(
             ForwardKind::Remote,
+            true,
             &text("127.0.0.1:9000"),
             &text("localhost:3000"),
         );
@@ -415,12 +434,26 @@ mod tests {
         assert_eq!(entrance.detail.as_ref(), "监听 127.0.0.1:9000");
         assert_eq!(exit.machine, Machine::Local);
         assert_eq!(reached.detail.as_ref(), "localhost:3000");
+
+        let [entrance, exit, reached] = stops(
+            ForwardKind::Remote,
+            false,
+            &text("127.0.0.1:1080"),
+            &text(""),
+        );
+        assert_eq!(entrance.machine, Machine::Server);
+        assert_eq!(entrance.name.as_ref(), "SSH 服务器");
+        assert_eq!(entrance.detail.as_ref(), "SOCKS 127.0.0.1:1080");
+        assert_eq!(exit.machine, Machine::Local);
+        assert_eq!(reached.machine, Machine::Anywhere);
+        assert_eq!(reached.detail.as_ref(), "由应用指定");
     }
 
     #[test]
     fn a_dynamic_forward_reaches_wherever_the_client_asks() {
         let [entrance, exit, reached] = stops(
             ForwardKind::Dynamic,
+            false,
             &text("127.0.0.1:1080"),
             &text("ignored"),
         );
@@ -434,15 +467,29 @@ mod tests {
     #[test]
     fn the_sentence_says_who_connects_where_for_each_kind() {
         assert_eq!(
-            explain(ForwardKind::Local, "127.0.0.1:8080", "db.internal:3306"),
+            explain(
+                ForwardKind::Local,
+                true,
+                "127.0.0.1:8080",
+                "db.internal:3306"
+            ),
             "在本机连接 127.0.0.1:8080，就等于从 SSH 服务器连接 db.internal:3306。"
         );
         assert_eq!(
-            explain(ForwardKind::Remote, "127.0.0.1:9000", "localhost:3000"),
+            explain(
+                ForwardKind::Remote,
+                true,
+                "127.0.0.1:9000",
+                "localhost:3000"
+            ),
             "在 SSH 服务器上连接 127.0.0.1:9000，就等于从本机连接 localhost:3000。"
         );
         assert_eq!(
-            explain(ForwardKind::Dynamic, "127.0.0.1:1080", ""),
+            explain(ForwardKind::Remote, false, "127.0.0.1:1080", ""),
+            "把 SSH 服务器上应用的 SOCKS 代理设为 127.0.0.1:1080，它的连接都从本机发出。"
+        );
+        assert_eq!(
+            explain(ForwardKind::Dynamic, false, "127.0.0.1:1080", ""),
             "把应用的 SOCKS5 代理设为 127.0.0.1:1080，它的连接都从 SSH 服务器发出。"
         );
     }

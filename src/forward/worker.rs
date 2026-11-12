@@ -376,12 +376,16 @@ impl SshForwardTransport {
                     // The handler feeding this is gone, and with it the
                     // connection: this is how an idle forward finds out.
                     None => break CarryEnd::ConnectionLost,
-                    Some(open) => match &self.target {
-                        Some(target)
-                            if self.kind == ForwardKind::Remote
-                                && open.connected_port == u32::from(self.bind.port) =>
+                    Some(open) => match (&self.target, self.kind) {
+                        (Some(target), ForwardKind::Remote)
+                            if open.connected_port == u32::from(self.bind.port) =>
                         {
                             connections.spawn(carry_remote(open, target.clone()));
+                        }
+                        (None, ForwardKind::Remote)
+                            if open.connected_port == u32::from(self.bind.port) =>
+                        {
+                            connections.spawn(carry_remote_dynamic(open));
                         }
                         // Not something this forward asked for.
                         _ => {
@@ -655,6 +659,63 @@ async fn carry_remote(open: ForwardedTcpip, target: ForwardEndpoint) -> Option<S
     };
     open.reply.accept().await;
     let mut stream = open.channel.into_stream();
+    let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
+    None
+}
+
+/// `ssh -R [port]`: someone connected to the server's SOCKS port; they tell
+/// us via SOCKS where to connect, and this machine connects to the target.
+async fn carry_remote_dynamic(open: ForwardedTcpip) -> Option<String> {
+    open.reply.accept().await;
+    let mut stream = open.channel.into_stream();
+    let request = match tokio::time::timeout(SOCKS_TIMEOUT, socks::negotiate(&mut stream)).await {
+        Ok(Ok(request)) => request,
+        Ok(Err(SocksError::Version)) => {
+            return Some(t!("forward.error.not_socks").to_string());
+        }
+        Ok(Err(_)) | Err(_) => return None,
+    };
+    let target = &request.target;
+    let dial = TcpStream::connect((target.host.as_str(), target.port));
+    let mut socket = match tokio::time::timeout(DIAL_TIMEOUT, dial).await {
+        Ok(Ok(socket)) => socket,
+        failed => {
+            let code = match &failed {
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    SocksReply::ConnectionRefused
+                }
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    SocksReply::NotAllowed
+                }
+                _ => SocksReply::GeneralFailure,
+            };
+            let _ = socks::reply(&mut stream, request.version, code).await;
+            let reason = match failed {
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    t!("forward.error.local_refused").to_string()
+                }
+                Ok(Err(error)) => error.to_string(),
+                _ => t!("forward.error.local_timed_out").to_string(),
+            };
+            return Some(
+                t!(
+                    "forward.error.local_target_failed",
+                    target = format!("{}:{}", target.host, target.port),
+                    reason = reason
+                )
+                .to_string(),
+            );
+        }
+    };
+    if socks::reply(&mut stream, request.version, SocksReply::Succeeded)
+        .await
+        .is_err()
+    {
+        return None;
+    }
+    if !request.leftover.is_empty() && socket.write_all(&request.leftover).await.is_err() {
+        return None;
+    }
     let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
     None
 }

@@ -312,6 +312,52 @@ async fn a_remote_forward_swaps_the_machines_in_the_picture_and_the_labels(
 }
 
 #[gpui_kit::test]
+async fn a_remote_forward_can_switch_to_dynamic_mode(cx: &mut TestAppContext) {
+    let (store, id) = store_with_forward();
+    let (handle, workspace) =
+        open_workspace_with_forwards(cx, store, Arc::new(FakeForwardProvider::default()));
+    cx.run_until_parked();
+    show_forwards(cx, handle).await;
+    in_frame(cx, handle, |window, cx| {
+        window.click(("forward-row", id.0), cx);
+        window.dispatch_action(Box::new(EditForward(id)), cx);
+    });
+    in_frame(cx, handle, |window, cx| {
+        window.within("forward-kind").click(1usize, cx);
+    });
+    in_frame(cx, handle, |window, cx| {
+        // Initially in fixed mode with target fields.
+        assert!(window.try_find("forward-target-host").is_some());
+        // Switch to dynamic mode.
+        window.within("forward-remote-mode").click(1usize, cx);
+    });
+    in_frame(cx, handle, |window, cx| {
+        // Target fields are now hidden.
+        assert!(window.try_find("forward-target-host").is_none());
+        assert_eq!(
+            window.find("forward-diagram").label(),
+            Some("SSH 服务器 → 本机 → 任意地址")
+        );
+        assert_eq!(
+            window.find("forward-explanation").label(),
+            Some("把 SSH 服务器上应用的 SOCKS 代理设为 127.0.0.1:8080，它的连接都从本机发出。")
+        );
+        window.click("commit", cx);
+    });
+    cx.wait_for(handle.into(), Duration::from_secs(2), |window, _| {
+        window.try_find("commit").is_none()
+    })
+    .await;
+    cx.update(|cx| {
+        let store = workspace.read(cx).store().read(cx);
+        let rule = store.forward(id).unwrap();
+        assert_eq!(rule.kind, ForwardKind::Remote);
+        assert_eq!(rule.target, None);
+        assert_eq!(rule.summary(), "SOCKS 8080");
+    });
+}
+
+#[gpui_kit::test]
 async fn a_forward_starts_and_stops_from_its_row_and_from_the_keyboard(cx: &mut TestAppContext) {
     let (mut store, first) = store_with_forward();
     let second = store

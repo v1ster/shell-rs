@@ -178,10 +178,11 @@ impl ForwardDraft {
         if self.bind.port == 0 {
             return Err(ForwardDraftError::BindPort);
         }
-        self.target = match (self.kind.has_target(), self.target) {
-            (false, _) => None,
-            (true, None) => return Err(ForwardDraftError::TargetHost),
-            (true, Some(mut target)) => {
+        self.target = match (self.kind, self.target) {
+            (ForwardKind::Dynamic, _) => None,
+            (ForwardKind::Local, None) => return Err(ForwardDraftError::TargetHost),
+            (ForwardKind::Remote, None) => None,
+            (ForwardKind::Local | ForwardKind::Remote, Some(mut target)) => {
                 target.host = valid_host(&target.host).ok_or(ForwardDraftError::TargetHost)?;
                 if target.port == 0 {
                     return Err(ForwardDraftError::TargetPort);
@@ -340,6 +341,11 @@ mod tests {
         let mut draft = local();
         draft.kind = ForwardKind::Dynamic;
         assert_eq!(draft.validated().unwrap().target, None);
+
+        let mut remote_dynamic = local();
+        remote_dynamic.kind = ForwardKind::Remote;
+        remote_dynamic.target = None;
+        assert_eq!(remote_dynamic.validated().unwrap().target, None);
     }
 
     #[test]
@@ -360,6 +366,13 @@ mod tests {
         dynamic.kind = ForwardKind::Dynamic;
         dynamic.bind.port = 1080;
         let rule = ForwardRule::new(ForwardId(3), dynamic.validated().unwrap());
+        assert_eq!(rule.summary(), "SOCKS 1080");
+
+        let mut remote_dynamic = local();
+        remote_dynamic.kind = ForwardKind::Remote;
+        remote_dynamic.target = None;
+        remote_dynamic.bind.port = 1080;
+        let rule = ForwardRule::new(ForwardId(4), remote_dynamic.validated().unwrap());
         assert_eq!(rule.summary(), "SOCKS 1080");
     }
 

@@ -443,10 +443,11 @@ fn parse_forward(r: &Reader) -> Result<ForwardData, String> {
     };
     let target = match (kind, target_host, target_port) {
         (ForwardKind::Dynamic, None, None) => None,
+        (ForwardKind::Remote, None, None) => None,
         (ForwardKind::Local | ForwardKind::Remote, Some(host), Some(port)) => {
             Some(Endpoint { host, port })
         }
-        _ => return Err("a dynamic forward has no target, the others one".into()),
+        _ => return Err("invalid target for forward kind".into()),
     };
     Ok(ForwardData {
         host: r.id("host")?.ok_or("a forward has no host")?,
@@ -1050,6 +1051,22 @@ pub(crate) mod tests {
         };
         assert!(parse(&RecordKey::new(Kind::Forward, "f"), &forward).is_err());
         assert!(parse(&RecordKey::new(Kind::Other("tag".into()), "t"), &Map::new()).is_err());
+    }
+
+    #[test]
+    fn remote_dynamic_forward_round_trips() {
+        let forward = RecordData::Forward(ForwardData {
+            host: "h1".into(),
+            name: "socks remote".into(),
+            kind: ForwardKind::Remote,
+            bind_host: "0.0.0.0".into(),
+            bind_port: 1080,
+            target: None,
+            sort_order: 2,
+        });
+        let key = RecordKey::new(Kind::Forward, "f3");
+        let fields = write_into(&forward, None);
+        assert_eq!(parse(&key, &fields), Ok(forward));
     }
 
     #[test]

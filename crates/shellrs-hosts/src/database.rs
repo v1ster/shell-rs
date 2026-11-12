@@ -42,8 +42,9 @@ fn from_sql(id: i64) -> u64 {
 /// host's right sidebar, 18 the saved local terminals, 19 their titles, 20
 /// what sync needs, 21 the snippet categories' nesting and the snippets'
 /// order, 22 目录跟随 per host, 23 the user a host logs in as with its
-/// credential, 24 the one-time codes an SSH host fills in.
-const SCHEMA_VERSION: i64 = 24;
+/// credential, 24 the one-time codes an SSH host fills in, 25 remote
+/// dynamic forwarding.
+const SCHEMA_VERSION: i64 = 25;
 
 /// The whole schema, as a new database gets it.
 ///
@@ -228,9 +229,10 @@ CREATE TABLE forwards (
     sort_order  INTEGER NOT NULL DEFAULT 0,
     sync_id     TEXT NOT NULL DEFAULT '',
     edited_ms   INTEGER NOT NULL DEFAULT 0,
-    CHECK ((kind = 'dynamic' AND target_host IS NULL AND target_port IS NULL)
-        OR (kind <> 'dynamic' AND target_host IS NOT NULL
-            AND target_port BETWEEN 1 AND 65535))
+    CHECK ((kind = 'local' AND target_host IS NOT NULL AND target_port BETWEEN 1 AND 65535)
+        OR (kind = 'dynamic' AND target_host IS NULL AND target_port IS NULL)
+        OR (kind = 'remote' AND ((target_host IS NULL AND target_port IS NULL)
+            OR (target_host IS NOT NULL AND target_port BETWEEN 1 AND 65535))))
 ) STRICT;
 CREATE INDEX forwards_host_id ON forwards(host_id);
 CREATE UNIQUE INDEX forwards_sync_id ON forwards(sync_id);
@@ -314,7 +316,7 @@ enum Step {
 ///
 /// A step is history: it says what that version's change was, and stays as
 /// written when `SCHEMA` changes again.
-const STEPS: [(i64, Step); 11] = [
+const STEPS: [(i64, Step); 12] = [
     (
     13,
     // The command snippets.
@@ -464,7 +466,49 @@ PRAGMA user_version = 24;
 COMMIT;",
         ),
     ),
+    // Remote forwards can now be dynamic (no target) as well as fixed.
+    (24, Step::Code(add_remote_dynamic)),
 ];
+
+fn add_remote_dynamic(connection: &Connection) -> rusqlite::Result<()> {
+    connection.pragma_update(None, "foreign_keys", false)?;
+    let result = connection.execute_batch(REMOTE_DYNAMIC_FORWARDS);
+    if result.is_err() {
+        let _ = connection.execute_batch("ROLLBACK");
+    }
+    connection.pragma_update(None, "foreign_keys", true)?;
+    result
+}
+
+const REMOTE_DYNAMIC_FORWARDS: &str = "BEGIN;
+DROP TABLE IF EXISTS forwards_24;
+CREATE TEMP TABLE forwards_24 AS SELECT * FROM main.forwards;
+DROP TABLE main.forwards;
+CREATE TABLE forwards (
+    id          INTEGER PRIMARY KEY,
+    host_id     INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL DEFAULT '',
+    kind        TEXT NOT NULL CHECK (kind IN ('local', 'remote', 'dynamic')),
+    bind_host   TEXT NOT NULL,
+    bind_port   INTEGER NOT NULL CHECK (bind_port BETWEEN 1 AND 65535),
+    target_host TEXT,
+    target_port INTEGER,
+    auto_start  INTEGER NOT NULL DEFAULT 0 CHECK (auto_start IN (0, 1)),
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    sync_id     TEXT NOT NULL DEFAULT '',
+    edited_ms   INTEGER NOT NULL DEFAULT 0,
+    CHECK ((kind = 'local' AND target_host IS NOT NULL AND target_port BETWEEN 1 AND 65535)
+        OR (kind = 'dynamic' AND target_host IS NULL AND target_port IS NULL)
+        OR (kind = 'remote' AND ((target_host IS NULL AND target_port IS NULL)
+            OR (target_host IS NOT NULL AND target_port BETWEEN 1 AND 65535))))
+) STRICT;
+INSERT INTO forwards (id, host_id, name, kind, bind_host, bind_port, target_host, target_port, auto_start, sort_order, sync_id, edited_ms)
+SELECT id, host_id, name, kind, bind_host, bind_port, target_host, target_port, auto_start, sort_order, sync_id, edited_ms FROM forwards_24;
+DROP TABLE forwards_24;
+CREATE INDEX forwards_host_id ON forwards(host_id);
+CREATE UNIQUE INDEX forwards_sync_id ON forwards(sync_id);
+PRAGMA user_version = 25;
+COMMIT;";
 
 /// Version 16, the Telnet hosts: `protocol` takes `telnet`, and the two
 /// `telnet_*` columns come after the serial ones. SQLite cannot change the
@@ -2105,6 +2149,14 @@ fn migrate(connection: &Connection) -> Result<(), OpenError> {
     if version < SCHEMA_VERSION {
         back_up(connection, version);
     }
+    // A database that was on a preliminary build (e.g. 0.1.18.rc1) might have
+    // its user_version bumped to 23 by add_remote_dynamic before upstream's 23
+    // (credential_username) and 24 (one_time_code) were introduced. If
+    // credential_username is missing, reset version to 22 so step 22 and 23 run.
+    if version >= 23 && !has_column(connection, "hosts", "credential_username")? {
+        version = 22;
+        connection.pragma_update(None, "user_version", 22)?;
+    }
     for (from, step) in STEPS {
         if version == from {
             match step {
@@ -2115,6 +2167,18 @@ fn migrate(connection: &Connection) -> Result<(), OpenError> {
         }
     }
     Ok(())
+}
+
+fn has_column(connection: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// A snippet's scope as its two columns: the group's, the host's.
@@ -3078,12 +3142,73 @@ INSERT INTO snippets (id, category_id, name, command, sync_id, edited_ms) \
     }
 
     #[test]
-    fn a_version_22_file_gets_the_credential_user_column_and_keeps_its_hosts() {
+    fn a_version_24_file_allows_dynamic_remote_forwards() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shellrs.db");
         {
-            // Version 22 as files of it have it: 15's schema, taken on by
-            // its steps.
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(&format!(
+                "BEGIN;\n{SCHEMA_15}\nPRAGMA user_version = 15;\nCOMMIT;"
+            ))
+            .unwrap();
+            add_telnet(&old).unwrap();
+            for (_, step) in &STEPS[3..6] {
+                let Step::Sql(sql) = step else {
+                    panic!("versions 17 to 19 are SQL steps");
+                };
+                old.execute_batch(sql).unwrap();
+            }
+            add_sync(&old).unwrap();
+            for (_, step) in &STEPS[7..11] {
+                let Step::Sql(sql) = step else {
+                    panic!("versions 21 to 24 are SQL steps");
+                };
+                old.execute_batch(sql).unwrap();
+            }
+            old.execute(
+                "INSERT INTO hosts (id, name, address, port, auth, username) \
+                 VALUES (1, 'web', '10.0.0.1', 22, 'password', 'root')",
+                [],
+            )
+            .unwrap();
+            old.execute(
+                "INSERT INTO forwards (id, host_id, kind, bind_host, bind_port, target_host, target_port) \
+                 VALUES (1, 1, 'remote', '127.0.0.1', 8080, 'localhost', 80)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = HostDatabase::open(&path).unwrap();
+        let version: i64 = db
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(dir.path().join("shellrs.db.v24.bak").exists());
+        let fresh = HostDatabase::in_memory().unwrap();
+        assert_eq!(schema_of(&db.connection), schema_of(&fresh.connection));
+
+        // The existing fixed forward is kept, and a dynamic remote forward can now be added.
+        let data = db.load().unwrap();
+        assert_eq!(data.forwards.len(), 1);
+        assert_eq!(data.forwards[0].kind, ForwardKind::Remote);
+        assert!(data.forwards[0].target.is_some());
+
+        let mut dynamic_remote = forward(2, 1, ForwardKind::Remote, 1080);
+        dynamic_remote.target = None;
+        assert!(db.insert_forward(&dynamic_remote).is_ok());
+        let data = db.load().unwrap();
+        assert_eq!(data.forwards.len(), 2);
+    }
+
+    #[test]
+    fn a_database_marked_version_23_without_credential_user_is_healed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shellrs.db");
+        {
+            // Simulate a DB that ran 0.1.18.rc1: reached version 23 by dynamic forwards,
+            // but without the later credential_username (v23) or one_time_code (v24).
             let old = Connection::open(&path).unwrap();
             old.execute_batch(&format!(
                 "BEGIN;\n{SCHEMA_15}\nPRAGMA user_version = 15;\nCOMMIT;"
@@ -3103,11 +3228,11 @@ INSERT INTO snippets (id, category_id, name, command, sync_id, edited_ms) \
                 };
                 old.execute_batch(sql).unwrap();
             }
+            // Manually set user_version to 23 (as 0.1.18.rc1 did).
             old.execute_batch(
-                "INSERT INTO credentials (id, keychain_id, name, kind, username, sort_order) \
- VALUES (1, 'c1aaaaaaaaaaaaaa', '部署', 'agent', 'deploy', 0);
-INSERT INTO hosts (id, name, address, port, auth, credential_id, edited_ms) \
- VALUES (1, 'web', '10.0.0.1', 22, 'credential', 1, 5);",
+                "INSERT INTO hosts (id, name, address, port, auth, username, edited_ms) \
+ VALUES (1, 'web', '10.0.0.1', 22, 'password', 'root', 5);
+PRAGMA user_version = 23;",
             )
             .unwrap();
         }
@@ -3118,17 +3243,12 @@ INSERT INTO hosts (id, name, address, port, auth, credential_id, edited_ms) \
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert!(dir.path().join("shellrs.db.v22.bak").exists());
         let fresh = HostDatabase::in_memory().unwrap();
         assert_eq!(schema_of(&db.connection), schema_of(&fresh.connection));
 
-        // Still the credential's user; nothing else touched.
         let data = db.load().unwrap();
-        let web = &data.hosts[0];
-        assert_eq!(
-            (web.credential, web.user.as_ref(), web.edited_ms),
-            (Some(CredentialId(1)), "", 5)
-        );
+        assert_eq!(data.hosts.len(), 1);
+        assert_eq!(data.hosts[0].user.as_ref(), "root");
     }
 
     #[test]
@@ -4023,6 +4143,11 @@ INSERT INTO hosts (id, name, address, port, auth, credential_id, edited_ms) \
             db.insert_forward(&forward(3, 99, ForwardKind::Local, 8080))
                 .is_err()
         );
+
+        // A remote forward can be dynamic (no target).
+        let mut remote_without_target = forward(4, 1, ForwardKind::Remote, 9000);
+        remote_without_target.target = None;
+        assert!(db.insert_forward(&remote_without_target).is_ok());
     }
 
     #[test]

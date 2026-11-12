@@ -20,7 +20,10 @@ use crate::host::{
     HostId, HostStore, KindLabel as _, join_sentences,
 };
 use crate::i18n::t;
-use crate::shared::{commit_footer, dismiss_form_error, form_error_notification, parse_port};
+use crate::shared::{
+    Segment, SegmentedControl, commit_footer, dismiss_form_error, form_error_notification,
+    parse_port,
+};
 
 /// The dialog's width in rems: room for the three stops of the diagram side
 /// by side, and for three kind cards that each hold their line of purpose
@@ -37,6 +40,27 @@ const DIALOG_MAX_HEIGHT: f32 = 0.9;
 /// line of purpose is pulled back by this much, to run under the dot too.
 const RADIO_DOT_COLUMN: f32 = 1.375;
 
+/// Which mode a remote forward runs in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RemoteMode {
+    /// `ssh -R 8080:localhost:80`: server listens, this machine connects to target.
+    #[default]
+    Fixed,
+    /// `ssh -R 1080`: server listens as a SOCKS proxy, this machine connects dynamically.
+    Dynamic,
+}
+
+impl RemoteMode {
+    pub const ALL: [RemoteMode; 2] = [RemoteMode::Fixed, RemoteMode::Dynamic];
+
+    pub fn label(self) -> SharedString {
+        match self {
+            RemoteMode::Fixed => t!("forward.dialog.remote_mode_fixed"),
+            RemoteMode::Dynamic => t!("forward.dialog.remote_mode_dynamic"),
+        }
+    }
+}
+
 /// The body of the new/edit forward dialog. Owns the field states and
 /// validates on commit; the store is only touched when validation passes.
 ///
@@ -49,6 +73,7 @@ pub struct ForwardForm {
     /// change to what it does restarts it.
     editing_active: bool,
     kind: ForwardKind,
+    remote_mode: RemoteMode,
     /// Counts the changes of kind. Each starts the diagram's flow over at
     /// the new entrance.
     flow: u64,
@@ -95,13 +120,17 @@ impl ForwardForm {
             )
         };
         let kind = draft.as_ref().map(|draft| draft.kind).unwrap_or_default();
+        let target = draft.as_ref().and_then(|draft| draft.target.clone());
+        let remote_mode = match (kind, target.as_ref()) {
+            (ForwardKind::Remote, None) => RemoteMode::Dynamic,
+            _ => RemoteMode::Fixed,
+        };
         // A new rule names no host: which server a port is opened through is
         // for the user to pick, not for a default to pick for them.
         let host_ix = draft
             .as_ref()
             .and_then(|draft| host_ids.iter().position(|id| *id == draft.host));
         let bind = draft.as_ref().map(|draft| draft.bind.clone());
-        let target = draft.as_ref().and_then(|draft| draft.target.clone());
         let port_text = |port: Option<u16>| port.map(|port| port.to_string()).unwrap_or_default();
 
         let name = cx.new(|cx| {
@@ -123,7 +152,7 @@ impl ForwardForm {
         });
         let bind_port = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder(bind_port_placeholder(kind))
+                .placeholder(bind_port_placeholder(kind, remote_mode))
                 .default_value(port_text(bind.as_ref().map(|bind| bind.port)))
         });
         let target_host = cx.new(|cx| {
@@ -161,6 +190,7 @@ impl ForwardForm {
             editing,
             editing_active,
             kind,
+            remote_mode,
             flow: 0,
             name,
             host,
@@ -187,7 +217,7 @@ impl ForwardForm {
         self.kind = kind;
         self.flow += 1;
         self.bind_port.update(cx, |input, cx| {
-            input.set_placeholder(bind_port_placeholder(kind), window, cx)
+            input.set_placeholder(bind_port_placeholder(kind, self.remote_mode), window, cx)
         });
         self.target_host.update(cx, |input, cx| {
             input.set_placeholder(target_host_placeholder(kind), window, cx)
@@ -196,6 +226,26 @@ impl ForwardForm {
             input.set_placeholder(target_port_placeholder(kind), window, cx)
         });
         cx.notify();
+    }
+
+    fn set_remote_mode(&mut self, mode: RemoteMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remote_mode == mode {
+            return;
+        }
+        self.remote_mode = mode;
+        self.flow += 1;
+        self.bind_port.update(cx, |input, cx| {
+            input.set_placeholder(bind_port_placeholder(self.kind, mode), window, cx)
+        });
+        cx.notify();
+    }
+
+    fn has_target(&self) -> bool {
+        match self.kind {
+            ForwardKind::Local => true,
+            ForwardKind::Dynamic => false,
+            ForwardKind::Remote => self.remote_mode == RemoteMode::Fixed,
+        }
     }
 
     fn selected_host(&self, cx: &App) -> Option<usize> {
@@ -217,7 +267,6 @@ impl ForwardForm {
             )
         };
         let target = self
-            .kind
             .has_target()
             .then(|| endpoint(&self.target_host, &self.target_port));
         Some(
@@ -338,15 +387,18 @@ impl ForwardForm {
 
     fn render_explanation(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let has_target = self.has_target();
         let bind = Self::endpoint_text(&self.bind_host, &self.bind_port, cx);
         let target = Self::endpoint_text(&self.target_host, &self.target_port, cx);
-        let sentence = explain(self.kind, &bind, &target);
+        let sentence = explain(self.kind, has_target, &bind, &target);
         v_flex()
             .gap_3()
             .p_3()
             .rounded(theme.radius)
             .bg(theme.muted)
-            .child(ForwardDiagram::new(self.kind, bind, target, self.flow))
+            .child(ForwardDiagram::new(
+                self.kind, has_target, bind, target, self.flow,
+            ))
             .child(
                 v_flex()
                     .gap_1()
@@ -362,23 +414,43 @@ impl ForwardForm {
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(typical_use(self.kind)),
+                            .child(typical_use(self.kind, has_target)),
                     ),
             )
     }
 
-    fn render_fields(&self) -> impl IntoElement {
+    fn render_fields(&self, cx: &Context<Self>) -> impl IntoElement {
         let (bind_label, target_label) = match self.kind {
             ForwardKind::Local => (
                 t!("forward.dialog.bind_local"),
                 t!("forward.dialog.target_from_server"),
             ),
-            ForwardKind::Remote => (
-                t!("forward.dialog.bind_server"),
-                t!("forward.dialog.target_from_local"),
-            ),
+            ForwardKind::Remote => match self.remote_mode {
+                RemoteMode::Fixed => (
+                    t!("forward.dialog.bind_server"),
+                    t!("forward.dialog.target_from_local"),
+                ),
+                RemoteMode::Dynamic => (
+                    t!("forward.dialog.bind_socks_remote"),
+                    SharedString::default(),
+                ),
+            },
             ForwardKind::Dynamic => (t!("forward.dialog.bind_socks"), SharedString::default()),
         };
+        let remote_mode_choice = (self.kind == ForwardKind::Remote).then(|| {
+            let selected = RemoteMode::ALL
+                .iter()
+                .position(|mode| *mode == self.remote_mode);
+            SegmentedControl::new("forward-remote-mode")
+                .small()
+                .selected_index(selected)
+                .on_change(cx.listener(|this, ix: &usize, window, cx| {
+                    if let Some(mode) = RemoteMode::ALL.get(*ix) {
+                        this.set_remote_mode(*mode, window, cx);
+                    }
+                }))
+                .segments(RemoteMode::ALL.map(|mode| Segment::new(mode.label())))
+        });
         Form::new()
             .columns(4)
             .child(
@@ -399,6 +471,14 @@ impl ForwardForm {
                             .small(),
                     ),
             )
+            .when_some(remote_mode_choice, |form, control| {
+                form.child(
+                    Field::new()
+                        .label(t!("forward.dialog.remote_mode"))
+                        .col_span(4)
+                        .child(control),
+                )
+            })
             .child(
                 Field::new()
                     .label(bind_label)
@@ -412,7 +492,7 @@ impl ForwardForm {
                     .required(true)
                     .child(Input::new(&self.bind_port).id("forward-bind-port").small()),
             )
-            .when(self.kind.has_target(), |form| {
+            .when(self.has_target(), |form| {
                 form.child(
                     Field::new()
                         .label(target_label)
@@ -438,10 +518,13 @@ impl ForwardForm {
     }
 }
 
-fn bind_port_placeholder(kind: ForwardKind) -> &'static str {
+fn bind_port_placeholder(kind: ForwardKind, remote_mode: RemoteMode) -> &'static str {
     match kind {
         ForwardKind::Local => "8080",
-        ForwardKind::Remote => "9000",
+        ForwardKind::Remote => match remote_mode {
+            RemoteMode::Fixed => "9000",
+            RemoteMode::Dynamic => "1080",
+        },
         ForwardKind::Dynamic => "1080",
     }
 }
@@ -496,7 +579,7 @@ impl Render for ForwardForm {
             .w_full()
             .child(self.render_kinds(cx))
             .child(self.render_explanation(cx))
-            .child(self.render_fields())
+            .child(self.render_fields(cx))
             .child(
                 Checkbox::new("forward-auto-start")
                     .label(t!("forward.dialog.auto_start"))

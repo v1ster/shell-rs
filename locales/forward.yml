@@ -45,6 +45,9 @@ forward.explain.local:
 forward.explain.remote:
   zh-CN: 在 SSH 服务器上连接 %{bind}，就等于从本机连接 %{target}。
   en: Connecting to %{bind} on the SSH server is the same as connecting to %{target} from this computer.
+forward.explain.remote_dynamic:
+  zh-CN: 把 SSH 服务器上应用的 SOCKS 代理设为 %{bind}，它的连接都从本机发出。
+  en: Set an app’s SOCKS proxy on the SSH server to %{bind}, and its connections go out from this computer.
 forward.explain.dynamic:
   zh-CN: 把应用的 SOCKS5 代理设为 %{bind}，它的连接都从 SSH 服务器发出。
   en: Set an app’s SOCKS5 proxy to %{bind}, and its connections go out from the SSH server.
@@ -65,6 +68,9 @@ forward.typical_use.local:
 forward.typical_use.remote:
   zh-CN: 常见用途：把本机正在开发的服务给服务器那边访问，或接收 Webhook。
   en: "Typical use: let the server’s side reach a service you’re developing here, or receive webhooks."
+forward.typical_use.remote_dynamic:
+  zh-CN: 常见用途：让服务器那边的程序经由本机访问内网或互联网，不必为每个地址单独建转发。
+  en: "Typical use: let programs on the server reach the internet or your internal network through this computer."
 forward.typical_use.dynamic:
   zh-CN: 常见用途：让浏览器经由服务器上网，不必为每个地址单独建转发。
   en: "Typical use: browse through the server without a forward for each address."
@@ -81,6 +87,15 @@ forward.dialog.create:
 forward.dialog.kind_card:
   zh-CN: "%{kind}（%{flag}）"
   en: "%{kind} (%{flag})"
+forward.dialog.remote_mode:
+  zh-CN: 转发模式
+  en: Mode
+forward.dialog.remote_mode_fixed:
+  zh-CN: 固定转发
+  en: Fixed
+forward.dialog.remote_mode_dynamic:
+  zh-CN: 动态转发
+  en: Dynamic
 forward.dialog.name:
   zh-CN: 名称
   en: Name
@@ -102,6 +117,9 @@ forward.dialog.bind_local:
 forward.dialog.bind_server:
   zh-CN: 服务器监听地址
   en: Listen on the server
+forward.dialog.bind_socks_remote:
+  zh-CN: 服务器监听地址（SOCKS 代理）
+  en: Listen on the server (SOCKS proxy)
 forward.dialog.bind_socks:
   zh-CN: 本机监听地址（SOCKS 代理）
   en: Listen on this computer (SOCKS proxy)
