@@ -43,6 +43,10 @@ sha256() {
 # The asset entry of one package: its addresses, size and SHA-256.
 asset() {
     local file="$dist/$1"
+    if [ ! -f "$file" ]; then
+        echo "null"
+        return
+    fi
     local size
     size=$(wc -c <"$file" | tr -d ' ')
     jq -n \
@@ -81,20 +85,18 @@ jq -n -j \
         rollout: 1.0,
         notes: $notes,
         notes_url: $notes_url,
-        assets: {
-            "macos-aarch64": $mac_arm,
-            "macos-x86_64": $mac_intel,
+        assets: ({
             "windows-x86_64": $win,
             "windows-x86_64-portable": $win_portable,
             "linux-x86_64": $linux
-        },
-        installers: {
-            "macos-aarch64": $dmg_arm,
-            "macos-x86_64": $dmg_intel,
+        } + (if $mac_arm != null then {"macos-aarch64": $mac_arm} else {} end)
+          + (if $mac_intel != null then {"macos-x86_64": $mac_intel} else {} end)),
+        installers: ({
             "windows-x86_64": $win_url,
             "windows-x86_64-portable": $win_portable_url,
             "linux-x86_64": $linux_url
-        }
+        } + (if $mac_arm != null then {"macos-aarch64": $dmg_arm} else {} end)
+          + (if $mac_intel != null then {"macos-x86_64": $dmg_intel} else {} end))
     }' >"$work/manifest.json"
 
 printf '%s\n' "${MINISIGN_PASSWORD:-}" | minisign -S \

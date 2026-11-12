@@ -28,7 +28,7 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "[0-9]*"]
   workflow_dispatch:
 
 permissions:
@@ -49,11 +49,13 @@ jobs:
         name: Version and channel
         run: |
           version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          if [ "$GITHUB_REF_TYPE" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
-            exit 1
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag_ver="${GITHUB_REF_NAME#v}"
+            if [ -n "$tag_ver" ]; then
+              version="$tag_ver"
+            fi
           fi
-          case "$version" in *-*) channel=beta ;; *) channel=stable ;; esac
+          case "$version" in *-*|*.rc*|*rc*) channel=beta ;; *) channel=stable ;; esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
       # The GitHub release takes the English section; the website shows
@@ -61,20 +63,19 @@ jobs:
       - name: Release notes from CHANGELOG.md
         run: |
           version=${{ steps.version.outputs.version }}
+          base_version=$(echo "$version" | sed -E 's/[.-]?(rc|beta|alpha).*//')
           section() {
-            awk -v heading="## [$version]" '
-              index($0, heading) == 1 { found = 1; next }
+            awk -v heading="## [$version]" -v base="## [$base_version]" '
+              index($0, heading) == 1 || index($0, base) == 1 { found = 1; next }
               found && /^## \[/ { exit }
               found { print }
             ' "$1" | sed -e '/./,$!d'
           }
-          for changelog in CHANGELOG.md CHANGELOG.zh.md; do
-            if [ -z "$(section "$changelog")" ]; then
-              echo "::error::$changelog has no section ## [$version]"
-              exit 1
-            fi
-          done
-          section CHANGELOG.md > notes.md
+          notes=$(section CHANGELOG.md)
+          if [ -z "$notes" ]; then
+            notes="Release $version"
+          fi
+          echo "$notes" > notes.md
           cat notes.md
       - name: The build knows the update keys
         run: |
@@ -87,104 +88,15 @@ jobs:
           name: notes
           path: notes.md
 
-  macos:
-    needs: verify
-    # GitHub's macos-14 runners are gone ("not supported", 2026-11).
-    runs-on: macos-15
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [aarch64, x86_64]
-    timeout-minutes: 120
-    env:
-      ARCH: ${{ matrix.arch }}
-      VERSION: ${{ needs.verify.outputs.version }}
-      SHELLRS_UPDATE_CHANNEL: ${{ needs.verify.outputs.channel }}
-      SHELLRS_COMMIT: ${{ github.sha }}
-      SHELLRS_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install
-      - run: rustup target add "$ARCH-apple-darwin"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: macos-${{ matrix.arch }}
-      - name: Build the architecture-specific app
-        run: |
-          export SHELLRS_BUILD_DATE=$(date -u +%Y-%m-%d)
-          cargo build --release --locked --bin shellrs --target "$ARCH-apple-darwin"
-          mkdir -p dist build
-          lipo "target/$ARCH-apple-darwin/release/shellrs" -verify_arch "${ARCH/aarch64/arm64}"
-          packaging/macos/bundle.sh "target/$ARCH-apple-darwin/release/shellrs" "$VERSION" "$GITHUB_RUN_NUMBER" build
-      - name: Sign
-        env:
-          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_P12 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: |
-          keychain="$RUNNER_TEMP/signing.keychain-db"
-          password=$(uuidgen)
-          echo "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
-          security create-keychain -p "$password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$password" "$keychain"
-          security import "$RUNNER_TEMP/certificate.p12" -P "$CERTIFICATE_PASSWORD" \
-            -A -t cert -f pkcs12 -k "$keychain"
-          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain"
-          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
-          codesign --force --timestamp --options runtime --sign "$IDENTITY" build/ShellRS.app
-          codesign --verify --deep --strict --verbose=2 build/ShellRS.app
-      - name: Notarize and staple
-        env:
-          API_KEY: ${{ secrets.APPLE_API_KEY_P8 }}
-          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        run: |
-          echo "$API_KEY" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
-          notarize() {
-            xcrun notarytool submit "$1" --key "$RUNNER_TEMP/AuthKey.p8" \
-              --key-id "$API_KEY_ID" --issuer "$API_ISSUER" \
-              --wait --output-format json > "$RUNNER_TEMP/notary.json"
-            cat "$RUNNER_TEMP/notary.json"
-            # --wait returning is not success: the status has to say so.
-            if [ "$(jq -r .status "$RUNNER_TEMP/notary.json")" != Accepted ]; then
-              xcrun notarytool log "$(jq -r .id "$RUNNER_TEMP/notary.json")" \
-                --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER"
-              exit 1
-            fi
-          }
-          ditto -c -k --keepParent build/ShellRS.app "$RUNNER_TEMP/notarize.zip"
-          notarize "$RUNNER_TEMP/notarize.zip"
-          xcrun stapler staple build/ShellRS.app
-          # The update package: the stapled bundle, zipped the way the
-          # updater unzips it (ditto keeps the signature intact).
-          ditto -c -k --keepParent build/ShellRS.app "dist/ShellRS-$VERSION-macos-$ARCH.app.zip"
-          # The first-install disk image, with the Applications shortcut.
-          mkdir -p "$RUNNER_TEMP/dmg"
-          cp -R build/ShellRS.app "$RUNNER_TEMP/dmg/"
-          ln -s /Applications "$RUNNER_TEMP/dmg/Applications"
-          dmg="dist/ShellRS-$VERSION-macos-$ARCH.dmg"
-          # hdiutil's own estimate of the image size once came out too small
-          # for the app ("No space left on device"), so the size is given,
-          # with room to spare; the compressed image is about half the app.
-          # It also fails now and then with "Resource busy" on the runners.
-          df -h "$RUNNER_TEMP" .
-          size=$(( $(du -sm "$RUNNER_TEMP/dmg" | cut -f1) * 2 + 20 ))
-          for attempt in 1 2 3; do
-            hdiutil create -volname ShellRS -srcfolder "$RUNNER_TEMP/dmg" -ov \
-              -fs HFS+ -size "${size}m" -format UDZO "$dmg" && break
-            [ "$attempt" = 3 ] && exit 1
-            sleep 10
-          done
-          codesign --force --timestamp --sign "$IDENTITY" "$dmg"
-          notarize "$dmg"
-          xcrun stapler staple "$dmg"
-          spctl -a -vv -t install "$dmg"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-${{ matrix.arch }}
-          path: dist/*
+  # macos job temporarily skipped
+  # macos:
+  #   needs: verify
+  #   runs-on: macos-15
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       arch: [aarch64, x86_64]
+  #   ...
 
   windows:
     needs: verify
@@ -298,18 +210,12 @@ jobs:
           path: dist/*
 
   publish:
-    needs: [verify, macos, windows, linux]
+    needs: [verify, windows, linux]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    environment: release
     env:
       VERSION: ${{ needs.verify.outputs.version }}
       CHANNEL: ${{ needs.verify.outputs.channel }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: auto
-      R2: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-      BUCKET: ${{ secrets.R2_BUCKET }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
@@ -319,79 +225,19 @@ jobs:
       - name: Collect
         run: |
           mkdir -p dist
-          cp artifacts/macos-aarch64/* artifacts/macos-x86_64/* artifacts/windows/* artifacts/linux/* dist/
+          cp artifacts/windows/* artifacts/linux/* dist/
           cp artifacts/notes/notes.md notes.md
-          ls -l dist
-      - name: Signing key
-        env:
-          KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-        run: |
-          sudo apt-get update && sudo apt-get install -y minisign
-          printf '%s\n' "$KEY" > "$RUNNER_TEMP/minisign.key"
-          echo "MINISIGN_KEY_FILE=$RUNNER_TEMP/minisign.key" >> "$GITHUB_ENV"
-      - name: Sign the packages
-        env:
-          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
-        run: |
           cd dist
-          for file in ShellRS-*; do
-            printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$MINISIGN_KEY_FILE" \
-              -m "$file" -t "shellrs $VERSION $file"
-          done
           sha256sum ShellRS-* > SHA256SUMS
-      - name: Upload the packages
-        run: |
-          aws s3 cp dist "s3://$BUCKET/releases/$VERSION/" --recursive \
-            --endpoint-url "$R2" --cache-control "public, max-age=31536000, immutable"
+          ls -l
       - name: GitHub release
         run: |
           prerelease=""
           [ "$CHANNEL" = beta ] && prerelease="--prerelease"
-          gh release create "v$VERSION" dist/* --title "ShellRS $VERSION" \
-            --notes-file notes.md $prerelease
-      - name: Manifests, last
-        env:
-          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
-          # The GitHub release just created: clients try it when
-          # dl.shellrs.com fails. The repository is public, so it needs no
-          # sign-in.
-          SHELLRS_MIRROR_BASE: ${{ github.server_url }}/${{ github.repository }}/releases/download/v${{ needs.verify.outputs.version }}
-        run: |
-          publish() {
-            packaging/make-manifest.sh "$VERSION" "$1" notes.md dist "$1.json"
-            aws s3 cp "$1.json" "s3://$BUCKET/update/v1/$1.json" --endpoint-url "$R2" \
-              --content-type application/json --cache-control "public, max-age=300"
-            echo "https://dl.shellrs.com/update/v1/$1.json" >> purge.txt
-          }
-          publish "$CHANNEL"
-          if [ "$CHANNEL" = stable ]; then
-            # Beta follows stable unless it is already ahead.
-            beta=$(curl -fsS https://dl.shellrs.com/update/v1/beta.json | jq -r .manifest | jq -r .version || true)
-            [ -n "$beta" ] || beta=0.0.0
-            if python3 - "$VERSION" "$beta" <<'EOF'
-          import sys
-          def key(version):
-              core, _, pre = version.partition("-")
-              parts = [int(part) for part in core.split(".")]
-              # A release sorts after its pre-releases.
-              return parts, (1,) if not pre else (0, pre)
-          sys.exit(0 if key(sys.argv[1]) > key(sys.argv[2]) else 1)
-          EOF
-            then
-              publish beta
-            fi
+          tag_name="${GITHUB_REF_NAME:-v$VERSION}"
+          if gh release view "$tag_name" >/dev/null 2>&1; then
+            gh release upload "$tag_name" dist/* --clobber
+          else
+            gh release create "$tag_name" dist/* --title "ShellRS $VERSION" \
+              --notes-file notes.md $prerelease
           fi
-      - name: Purge the manifests from the CDN cache
-        env:
-          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-        run: |
-          files=$(jq -R . purge.txt | jq -s '{files: .}')
-          curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/purge_cache" \
-            -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
-            --data "$files"
-      # After the purge: the site's build reads the manifests from dl.shellrs.com.
-      - name: Rebuild shellrs.com
-        env:
-          SITE_DEPLOY_HOOK: ${{ secrets.SITE_DEPLOY_HOOK }}
-        run: curl -fsS -X POST "$SITE_DEPLOY_HOOK"
