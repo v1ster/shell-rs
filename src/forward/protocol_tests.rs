@@ -673,6 +673,36 @@ fn a_dynamic_forward_is_a_socks_proxy_for_both_protocol_versions() {
 }
 
 #[test]
+fn a_remote_dynamic_forward_is_a_socks_proxy_from_the_server() {
+    runtime().block_on(async {
+        let Some(server) = server().await else { return };
+        let (echo, _echo_task) = echo_server().await;
+        let fixture = Fixture::new(server.port);
+        let remote = free_port();
+        let run = fixture.start(ForwardKind::Remote, remote, None);
+        run.listening().await;
+
+        // Connect to the server's listening port and speak SOCKS5.
+        let mut socket = connect(remote).await;
+        socket.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method = [0_u8; 2];
+        socket.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x00]);
+
+        let mut request = vec![0x05, 0x01, 0x00, 0x03, 9];
+        request.extend_from_slice(b"localhost");
+        request.extend_from_slice(&echo.to_be_bytes());
+        socket.write_all(&request).await.unwrap();
+        let mut answer = [0_u8; 10];
+        socket.read_exact(&mut answer).await.unwrap();
+        assert_eq!(answer[..2], [0x05, 0x00]);
+        echoes(&mut socket, b"over remote socks5").await;
+
+        run.stop().await;
+    });
+}
+
+#[test]
 fn an_idle_forward_notices_the_connection_dropping_and_logs_in_again() {
     runtime().block_on(async {
         let Some(server) = server().await else { return };
